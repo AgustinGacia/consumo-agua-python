@@ -1,70 +1,110 @@
-import paho.mqtt.client as mqtt
 import os
+import paho.mqtt.client as mqtt
+from influxdb_client_3 import InfluxDBClient3, Point
 from dotenv import load_dotenv
-from influxdb_client import InfluxDBClient, Point, WritePrecision
+import json
+import re
+import time
+from datetime import datetime, timedelta, timezone
 
-# Cargar las variables de entorno desde el archivo .env
+# Cargar variables de entorno desde .env
 load_dotenv()
 
-# Configuración de MQTT
+# Configuración MQTT
 MQTT_BROKER = os.getenv("MQTT_BROKER")
 MQTT_PORT = int(os.getenv("MQTT_PORT"))
 MQTT_USERNAME = os.getenv("MQTT_USERNAME")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
-MQTT_TOPIC_FLUJO = os.getenv("MQTT_TOPIC_FLUJO")
-MQTT_TOPIC_VOLUMEN = os.getenv("MQTT_TOPIC_VOLUMEN")
-MQTT_TOPIC_VALVULA_APERTURA = os.getenv("MQTT_TOPIC_VALVULA_APERTURA")
-MQTT_TOPIC_CONSIGNA = os.getenv("MQTT_TOPIC_CONSIGNA")
 
-# Configuración de InfluxDB
+# Configuración InfluxDB 3.0
 INFLUXDB_URL = os.getenv("INFLUXDB_URL")
 INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN")
-INFLUXDB_ORG = os.getenv("INFLUXDB_ORG")
-INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET")
+INFLUXDB_BUCKET = os.getenv("INFLUXDB_BUCKET") 
+INFLUXDB_ORG = os.getenv("INFLUXDB_ORG") 
 
-# Conexión a InfluxDB
-influx_client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN)
-write_api = influx_client.write_api(write_options=WritePrecision.NS)
+# Crear cliente InfluxDB
+influx_client = InfluxDBClient3(
+    host=INFLUXDB_URL,
+    token=INFLUXDB_TOKEN,
+    org=INFLUXDB_ORG
+)
 
-# Función para manejar el mensaje recibido en MQTT
+# Callback al conectar al broker MQTT
+def on_connect(client, userdata, flags, rc):
+    print(f"on_connect: {rc}")
+    if rc == 0:
+        print("✅ Conexión exitosa al broker MQTT.")
+        client.subscribe("contador/#")
+        client.subscribe("valvula/#")
+        print("📡 Suscripción a 'contador/#' y 'valvula/#'")
+    else:
+        print(f"❌ Conexión fallida. Código: {rc}")
+
+# Callback al recibir mensaje MQTT
 def on_message(client, userdata, msg):
+    topic = msg.topic
     payload = msg.payload.decode()
-    print(f"Received message: {payload} on topic: {msg.topic}")
+    print(f"📩 Mensaje recibido: {payload} en el topic: {topic}")
 
-    # Publicar datos en InfluxDB
-    if msg.topic == MQTT_TOPIC_FLUJO:
-        flujo_data = float(payload)
-        point = Point("flujo").tag("sensor", "flujo_agua").field("value", flujo_data)
-        write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+    try:
+        # Parsear el JSON
+        payload_json = json.loads(payload)
+        data = float(payload_json["data"])
+        timestamp = int(payload_json["timestamp"])
 
-    elif msg.topic == MQTT_TOPIC_VOLUMEN:
-        volumen_data = float(payload)
-        point = Point("volumen").tag("sensor", "volumen_agua").field("value", volumen_data)
-        write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+        # Expresión regular para capturar tipo, id y medida
+        match = re.match(r'^(contador|valvula)/(\d{2})/(flujo|volumen|apertura)$', topic)
+        if not match:
+            print(f"⚠️ Topic no válido: {topic}")
+            return
 
-    elif msg.topic == MQTT_TOPIC_VALVULA_APERTURA:
-        apertura_data = float(payload)
-        point = Point("valvula_apertura").tag("sensor", "apertura_valvula").field("value", apertura_data)
-        write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+        tipo, id_tag, medicion = match.groups()
 
-    elif msg.topic == MQTT_TOPIC_CONSIGNA:
-        consigna_data = float(payload)
-        point = Point("valvula_consigna").tag("sensor", "consigna_valvula").field("value", consigna_data)
-        write_api.write(bucket=INFLUXDB_BUCKET, org=INFLUXDB_ORG, record=point)
+        # Nombre de la medida en InfluxDB
+        if medicion == "apertura":
+            point_name = "valvula_apertura"
+        else:
+            point_name = medicion  # "flujo" o "volumen"
+        
+        dt = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        
+        print(f"📩 El Point es: {point_name}, con el tag: {tipo} {id_tag}, en el timestamp {dt} ({timestamp}) con el valor {data}")
+        print(f"La hora a lo pampa {datetime.now(timezone.utc)}")
 
-# Conexión a MQTT
-client = mqtt.Client()
-client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-client.connect(MQTT_BROKER, MQTT_PORT)
+        # Crear el punto
+        point = (
+            Point(point_name)
+            .tag(tipo, id_tag)
+            .field("value", data)
+            .time(dt)
+        )
 
-# Suscribirse a los topics
-client.subscribe(MQTT_TOPIC_FLUJO)
-client.subscribe(MQTT_TOPIC_VOLUMEN)
-client.subscribe(MQTT_TOPIC_VALVULA_APERTURA)
-client.subscribe(MQTT_TOPIC_CONSIGNA)
+        # Guardar en InfluxDB
+        influx_client._write_api.write(
+            bucket=INFLUXDB_BUCKET,
+            org=INFLUXDB_ORG,
+            record=point
+        )
 
-# Establecer la función que maneja los mensajes
-client.on_message = on_message
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        print(f"❌ Error al procesar el mensaje: {e}. Payload: {payload}")
 
-# Mantener la conexión abierta
-client.loop_forever()
+# Configuración del cliente MQTT
+mqtt_client = mqtt.Client()
+mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+mqtt_client.tls_set(ca_certs="ca-cert.pem")  # TLS si es necesario
+
+# Conectar
+try:
+    print(f"🔌 Conectando al broker MQTT en {MQTT_BROKER}:{MQTT_PORT}...")
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+except Exception as e:
+    print(f"❌ Error de conexión MQTT: {e}")
+
+# Asignar callbacks
+mqtt_client.on_connect = on_connect
+mqtt_client.on_message = on_message
+
+# Bucle principal
+print("🚀 Iniciando bucle MQTT...")
+mqtt_client.loop_forever()
