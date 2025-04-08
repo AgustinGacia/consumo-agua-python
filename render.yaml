@@ -1,6 +1,6 @@
 services:
-  - type: worker
-    name: mqtt-influx-worker
+  - type: web
+    name: mqtt-influx-web
     runtime: python
     plan: free
     branch: main
